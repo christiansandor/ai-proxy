@@ -1,0 +1,11 @@
+services:
+  ai-proxy:
+    build: .
+    image: holdltd/ai-proxy
+    container_name: ai-proxy
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "5234:8080"
+    volumes:
+      - ./config.yaml:/app/config.yaml

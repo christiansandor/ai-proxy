@@ -1,0 +1,24 @@
+# Model aliases: map an incoming "model" value to the real model name.
+# Works for all JSON request bodies (/v1/chat/completions, /v1/embeddings, etc.)
+# and for the Gemini plugin (alias the constructed "gemini/<model>" name).
+#
+# Examples:
+#   "gpt-4o":                 "llama-3.3-70b-instruct"
+#   "text-embedding-ada-002": "nomic-embed-text"
+#   "gemini/gemini-embedding-001": "nomic-embed-text"
+#
+modelAliases:
+  gpt-4o: qwen3.5-9b
+  gemini-embedding-001: text-embedding-mxbai-embed-large-v1
+  gemini/gemini-embedding-001: text-embedding-mxbai-embed-large-v1
+
+services:
+  - name: Service Name
+    baseUrl: http://host:port
+    token: your-api-token-or-not-needed
+    health: /v1/models
+    geminiEmbeddingPath: /v1/embeddings
+    routes:
+      - /v1/models
+      - /v1/chat/completion
+      - /v1/embeddings
