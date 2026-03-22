@@ -15,6 +15,9 @@ from urllib.parse import urlparse
 
 import yaml
 
+import auth
+import audit
+
 _CONFIG_PATH = 'config.yaml'
 
 # Load configuration from config.yaml
@@ -152,6 +155,9 @@ _plugins = []
 def _load_plugins():
     import plugins as pkg
     for _, name, _ in pkgutil.iter_modules(pkg.__path__):
+        # admin_api is not a plugin — it's called directly from handle_request
+        if name == 'admin_api':
+            continue
         module = importlib.import_module(f'plugins.{name}')
         plugin = getattr(module, 'PLUGIN', None)
         if plugin is not None:
@@ -163,11 +169,7 @@ def _load_plugins():
 # ---------------------------------------------------------------------------
 
 class ProxyHandler(BaseHTTPRequestHandler):
-    """Proxy HTTP request handler.
-
-    Type annotation for PyTypeChecker: BaseHTTPRequestHandler[ThreadingHTTPServer]
-    This satisfies the expected generic type '(Any, Any, Self) -> BaseRequestHandler'.
-    """
+    """Proxy HTTP request handler."""
     # Expose shared state to plugins via the handler instance
     config = config
 
@@ -180,10 +182,60 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         print(f"→ {self.command} {self.path}", flush=True)
 
-        # ── Read body once up-front ──
+        # ── Read body once up-front ──────────────────────────────────────────
         content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length) if content_length > 0 else None
-        body = apply_model_alias(body, config.get('modelAliases', {}))
+        raw_body = self.rfile.read(content_length) if content_length > 0 else None
+        self._body = raw_body   # set early; admin handler reads this directly
+
+        # ── Path restriction: only /v1*, /v1beta/, /api/ ─────────────────────
+        p = self.path
+        if not (
+            p.startswith('/v1/') or p == '/v1'
+            or p.startswith('/v1beta/')
+            or p.startswith('/api/')
+        ):
+            self.send_error(404, "Not found")
+            return
+
+        # ── Admin API — own auth, no client token required ───────────────────
+        if p.startswith('/api/'):
+            from plugins.admin_api import handle_admin_request
+            handle_admin_request(self)
+            return
+
+        # ── Client token auth (/v1* and /v1beta/) ────────────────────────────
+        auth_header = self.headers.get('Authorization', '')
+        token_value = (
+            auth_header[len('Bearer '):].strip()
+            if auth_header.startswith('Bearer ')
+            else None
+        )
+        token_record = auth.validate_token(token_value) if token_value else None
+
+        if not token_record:
+            audit.log(
+                'auth.rejected',
+                method=self.command,
+                path=self.path,
+                ip=self.client_address[0],
+                reason='invalid_token' if token_value else 'missing_token',
+            )
+            self.send_error(401, "Unauthorized")
+            return
+
+        self._auth_token = token_record
+        audit.log(
+            'api.request',
+            method=self.command,
+            path=self.path,
+            ip=self.client_address[0],
+            token_id=token_record['id'],
+            label=token_record['label'],
+        )
+
+        # ── Apply model alias (after auth, before routing) ───────────────────
+        body = apply_model_alias(raw_body, config.get('modelAliases', {}))
+        self._body = body
 
         model_id = None
         if body:
@@ -192,23 +244,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-        self._body = body
-
-        # ── Try plugins first ──
+        # ── Try plugins first ────────────────────────────────────────────────
         for plugin in _plugins:
             if plugin.match(self.command, self.path):
                 plugin.handle(self)
                 return
 
-        # ── Normal proxy routing ──
+        # ── Normal proxy routing ─────────────────────────────────────────────
         services = self.find_services_for_route(self.path)
         if not services:
             print(f"✗ No service for {self.path}", flush=True)
             self.send_error(404, "No service found for this route")
             return
 
-        # Compute healthy candidates once — avoids repeated health check I/O
-        # in the routing loop below.
+        # Compute healthy candidates once
         healthy = [s for s in services if self.is_service_healthy(s, model_id=model_id)]
 
         # ── Pass 3: nothing healthy at all ──
@@ -218,9 +267,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         # ── Pass 1: healthy + free ──
-        # Try a non-blocking acquire on each healthy service.  First one that
-        # is free AND forwards successfully wins.  Services that fail to forward
-        # are invalidated and removed from the candidate list for Pass 2.
         remaining = list(healthy)
         for service in list(remaining):
             sem = _get_semaphore(service)
@@ -232,11 +278,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         return
                 finally:
                     sem.release()
-                # forward failed — drop this service from future consideration
                 print(f"✗ {service['name']} failed forwarding, invalidating", flush=True)
                 _invalidate_health_cache(service['name'])
                 remaining.remove(service)
-            # else: service is locked — leave it in `remaining` for Pass 2
 
         # ── Pass 3 (second check): all free services failed, nothing left ──
         if not remaining:
@@ -245,11 +289,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         # ── Pass 2: healthy + locked — queue behind each in turn ──
-        # All services in `remaining` are healthy but currently occupied.
-        # Try each one: wait up to its queueTimeoutSeconds for a slot, then
-        # attempt to forward.  Only move on to the next service if forwarding
-        # actually fails after acquiring the slot — a timeout on one service
-        # produces a 429 immediately (Pass 4) since all services are busy.
         for service in remaining:
             timeout = service.get('queueTimeoutSeconds', 300)
             print(
@@ -278,11 +317,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             finally:
                 sem.release()
 
-            # Forward failed after acquiring the slot — invalidate and try next
             print(f"✗ {service['name']} failed after queuing, trying next...", flush=True)
             _invalidate_health_cache(service['name'])
 
-        # All locked services acquired and attempted — all failed to forward
         print(f"✗ All queued services failed for {self.path}", flush=True)
         self.send_error(503, "No healthy service available for this route")
 
@@ -296,11 +333,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """
         Returns True when the service passes its health check AND (if model_id
         is given) that model is present in the service's advertised model list.
-
-        Thread-safe: uses _health_cache_lock for all reads and writes.
-        Uses an in-progress guard to prevent concurrent health-check stampedes —
-        if a check is already running for this service, we serve the last known
-        cached state rather than spawning a second parallel check.
         """
         name = service['name']
         now = time.time()
@@ -311,7 +343,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 is_healthy, model_ids, checked_at = cached
                 ttl = HEALTH_CACHE_TTL_HEALTHY if is_healthy else HEALTH_CACHE_TTL_UNHEALTHY
                 if now - checked_at < ttl:
-                    # Fast path — serve from cache without any I/O
                     if not is_healthy:
                         return False
                     if model_id and model_ids is not None and model_id not in model_ids:
@@ -322,17 +353,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         return False
                     return True
 
-            # Cache miss or stale — check if another thread is already doing this
             if name in _health_check_in_progress:
-                # Serve last known state rather than pile on
                 if cached is not None:
                     return cached[0]
-                return False   # no info at all — be pessimistic
+                return False
 
             _health_check_in_progress.add(name)
 
-        # ── Perform the actual health check outside the lock ──
-        # (network I/O; holding the lock here would block all other routing)
         is_healthy, model_ids = self._check_health(service)
 
         with _health_cache_lock:
@@ -350,11 +377,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return True
 
     def _check_health(self, service) -> tuple[bool, set | None]:
-        """
-        Fetches the service health URL and returns (is_healthy, model_ids).
-        Retries once after 0.5s on transient failures.
-        Timeout raised to 12s to tolerate busy backends.
-        """
+        """Fetches the service health URL. Retries once after 0.5s."""
         for attempt in range(2):
             try:
                 health_url = f"{service['baseUrl']}{service['health']}"
@@ -406,7 +429,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         headers = {
             k: v for k, v in self.headers.items()
-            if k.lower() not in ('host', 'content-length', 'transfer-encoding')
+            if k.lower() not in ('host', 'content-length', 'transfer-encoding',
+                                  'authorization')
         }
         if 'token' in service and service['token'] != 'not-needed':
             headers['Authorization'] = f"Bearer {service['token']}"
@@ -482,9 +506,12 @@ def run_server():
     watcher.start()
     print(f"→ [config] Watching {_CONFIG_PATH} for changes (poll every 2s)", flush=True)
 
+    print(f"→ [auth]  Client token auth enabled  (tokens: {auth.TOKENS_PATH})", flush=True)
+    print(f"→ [audit] Logging to {audit._LOG_DIR}", flush=True)
+
     server_address = ('', 8080)
     httpd = ThreadingHTTPServer(server_address, ProxyHandler)  # type: ignore[type-arg]
-    httpd.daemon_threads = True   # don't block shutdown on in-flight requests
+    httpd.daemon_threads = True
     print("Proxy server starting on http://localhost:8080")
     print("Configured services:")
     for service in config['services']:

@@ -1,3 +1,7 @@
+# Admin token — required to use the /api/tokens management endpoints.
+# Keep this secret; it is the only credential that can create/revoke client tokens.
+adminToken: "change-me-to-a-strong-secret"
+
 # Model aliases: map an incoming "model" value to the real model name.
 # Works for all JSON request bodies (/v1/chat/completions, /v1/embeddings, etc.)
 # and for the Gemini plugin (alias the constructed "gemini/<model>" name).

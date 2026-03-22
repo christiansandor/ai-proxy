@@ -6,6 +6,8 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY proxy.py .
+COPY auth.py .
+COPY audit.py .
 COPY plugins/ ./plugins/
 
 EXPOSE 8080

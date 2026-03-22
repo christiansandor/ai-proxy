@@ -9,3 +9,4 @@ services:
       - "5234:8080"
     volumes:
       - ./config.yaml:/app/config.yaml
+      - ./data:/app/data        # tokens.json + audit_logs/ live here
