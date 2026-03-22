@@ -1,0 +1,16 @@
+### GET Get available tokens
+GET {{url}}/api/tokens
+Authorization: Bearer {{adminToken}}
+
+### POST Create a new token
+POST {{url}}/api/tokens
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+    "label": "Test token"
+}
+
+### DELETE Revoke a token
+DELETE {{url}}/api/tokens/{{clientToken}}
+Authorization: Bearer {{adminToken}}

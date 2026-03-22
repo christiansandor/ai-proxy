@@ -34,11 +34,11 @@ def isolated_store(tmp_path):
 
 class TestCreateToken:
 
-    def test_returns_record_with_uuid(self):
+    def test_returns_record_with_sk_prefixed_token(self):
         import auth
         record = auth.create_token('my-app')
         assert re.match(
-            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            r'^sk-[0-9a-f]{64}$',
             record['id'],
         )
 

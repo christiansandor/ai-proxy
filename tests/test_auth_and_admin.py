@@ -156,15 +156,12 @@ class TestAdminCreateToken:
         assert body['label'] == 'my-app'
         assert body['revoked'] is False
 
-    def test_returned_id_is_uuid(self):
+    def test_returned_id_is_sk_prefixed_token(self):
         import re
         from plugins.admin_api import handle_admin_request
         h = _make_handler(method='POST', path='/api/tokens', body=b'{"label": "uuid-check"}')
         handle_admin_request(h)
-        assert re.match(
-            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-            _json(h)['id'],
-        )
+        assert re.match(r'^sk-[0-9a-f]{64}$', _json(h)['id'])
 
     def test_missing_label_returns_400(self):
         from plugins.admin_api import handle_admin_request
@@ -218,7 +215,7 @@ class TestAdminRevokeToken:
     def test_revoke_nonexistent_returns_404(self):
         from plugins.admin_api import handle_admin_request
         h = _make_handler(method='DELETE',
-                          path='/api/tokens/00000000-0000-0000-0000-000000000000')
+                          path='/api/tokens/sk-' + '0' * 64)
         handle_admin_request(h)
         assert h._sent['status'] == 404
 

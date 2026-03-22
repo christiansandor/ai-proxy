@@ -8,16 +8,15 @@ Requires ``adminToken`` to be set in config.yaml.
 
   GET    /api/tokens            list all tokens (including revoked)
   POST   /api/tokens            create a token   body: {"label": "..."}
-  DELETE /api/tokens/<uuid>     revoke a token
+  DELETE /api/tokens/<sk-token>  revoke a token
 """
 from __future__ import annotations
 
 import json
 import re
 
-_UUID_PAT = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-_UUID_RE  = re.compile(f'^{_UUID_PAT}$')
-_ROUTE_RE = re.compile(rf'^/api/tokens(?:/({_UUID_PAT}))?(?:\?.*)?$')
+_TOKEN_PAT = r'sk-[0-9a-f]{64}'
+_ROUTE_RE  = re.compile(rf'^/api/tokens(?:/({_TOKEN_PAT}))?(?:\?.*)?$')
 
 
 # ---------------------------------------------------------------------------

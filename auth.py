@@ -7,8 +7,8 @@ is a single dict lookup with no disk I/O on the hot path.
 from __future__ import annotations
 
 import json
+import secrets
 import threading
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -64,7 +64,7 @@ def create_token(label: str) -> dict:
     with _lock:
         data = _load()
         record: dict = {
-            'id':         str(uuid.uuid4()),
+            'id':         'sk-' + secrets.token_hex(32),
             'label':      label,
             'created_at': datetime.now(timezone.utc).isoformat(),
             'revoked':    False,
