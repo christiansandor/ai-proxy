@@ -2,23 +2,59 @@
 # Works for all JSON request bodies (/v1/chat/completions, /v1/embeddings, etc.)
 # and for the Gemini plugin (alias the constructed "gemini/<model>" name).
 #
-# Examples:
-#   "gpt-4o":                 "llama-3.3-70b-instruct"
-#   "text-embedding-ada-002": "nomic-embed-text"
-#   "gemini/gemini-embedding-001": "nomic-embed-text"
-#
 modelAliases:
   gpt-4o: qwen3.5-9b
   gemini-embedding-001: text-embedding-mxbai-embed-large-v1
   gemini/gemini-embedding-001: text-embedding-mxbai-embed-large-v1
 
 services:
-  - name: Service Name
-    baseUrl: http://host:port
-    token: your-api-token-or-not-needed
+    # One entry per physical host.  maxConcurrent and queueTimeoutSeconds
+    # control the per-service request queue.
+    #
+    # maxConcurrent (default: 1)
+    #   How many requests may be forwarded simultaneously.  Set to 1 for any
+    #   service that holds only one model in memory at a time (LM Studio,
+    #   most local setups) so that a new request never triggers a mid-stream
+    #   model eviction.
+    #
+    # queueTimeoutSeconds (default: 300)
+    #   How long a queued request will wait for a free slot before the proxy
+    #   returns 429.  Use a generous value for slow LLM generation (600s+) and
+    #   a tighter value for fast operations like embeddings if they are on a
+    #   dedicated host.  When LLMs and embeddings share the same physical host,
+    #   keep this value uniform and high — an embedding may have to wait behind
+    #   a multi-minute LLM response.
+
+  - name: work-lmstudio
+    baseUrl: http://work-pc:1234
+    token: not-needed
     health: /v1/models
+    maxConcurrent: 1          # serial — only one model loaded at a time
+    queueTimeoutSeconds: 600  # up to 10 min wait (large thinking models)
     geminiEmbeddingPath: /v1/embeddings
     routes:
       - /v1/models
-      - /v1/chat/completion
+      - /v1/chat/completions
       - /v1/embeddings
+
+  - name: home-lmstudio
+    baseUrl: http://home-pc:1234
+    token: not-needed
+    health: /v1/models
+    maxConcurrent: 1
+    queueTimeoutSeconds: 600
+    geminiEmbeddingPath: /v1/embeddings
+    routes:
+      - /v1/models
+      - /v1/chat/completions
+      - /v1/embeddings
+
+  - name: work-comfyui
+    baseUrl: http://work-pc:8188
+    token: not-needed
+    health: /health
+    maxConcurrent: 1
+    queueTimeoutSeconds: 300
+    routes:
+      - /api/prompt
+      - /api/queue

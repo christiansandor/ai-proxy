@@ -120,7 +120,6 @@ class GeminiEmbeddingPlugin(ProxyPlugin):
     def _handle_models(self, handler):
         capable = [s for s in handler.config['services'] if s.get('geminiEmbeddingPath')]
         base_names = {'gemini-embedding-001'} if capable else set()
-        # Any alias key of the form "gemini/<name>" also becomes a routable model
         aliases = handler.config.get('modelAliases', {})
         alias_names = {
             k[len('gemini/'):] for k in aliases
@@ -151,23 +150,30 @@ class GeminiEmbeddingPlugin(ProxyPlugin):
         openai_payload = _gemini_request_to_openai(model, gemini_body)
         incoming_token = _extract_bearer_token(handler.headers)
 
-        # Apply model alias to the constructed OpenAI model name
         aliases = handler.config.get('modelAliases', {})
         original_model = openai_payload['model']
         if original_model in aliases:
             openai_payload['model'] = aliases[original_model]
             print(f"→ [alias] {original_model!r} → {openai_payload['model']!r}", flush=True)
 
-        for service in capable:
-            if not handler.is_service_healthy(service):
-                continue
+        from proxy import _get_semaphore, _invalidate_health_cache
 
+        # Separate healthy services into free and locked, mirroring the
+        # four-pass routing logic in handle_request so that Gemini embedding
+        # requests respect the per-service semaphore and never trigger a
+        # mid-generation model eviction on LM Studio.
+        healthy = [s for s in capable if handler.is_service_healthy(s)]
+        if not healthy:
+            handler.send_error(503, "No healthy service with geminiEmbeddingPath available")
+            return
+
+        def _forward(service):
+            """Attempt the embedding call. Returns True on success."""
             service_token = service.get('token')
             token = (
-                    incoming_token
-                    or (service_token if service_token != 'not-needed' else None)
+                incoming_token
+                or (service_token if service_token != 'not-needed' else None)
             )
-
             forward_headers = {'Content-Type': 'application/json'}
             if token:
                 forward_headers['Authorization'] = f'Bearer {token}'
@@ -179,13 +185,12 @@ class GeminiEmbeddingPlugin(ProxyPlugin):
 
             if openai_body is None:
                 print(f"✗ [gemini] {service['name']} failed, trying next...", flush=True)
-                from proxy import _health_cache
-                _health_cache.pop(service['name'], None)
-                continue
+                _invalidate_health_cache(service['name'])
+                return False
 
             if status != 200:
                 _send_json(handler, status, openai_body, {'X-Ai-Proxy-Server': service['name']})
-                return
+                return True   # response sent (even if an error), stop iterating
 
             _send_json(
                 handler, 200,
@@ -193,7 +198,43 @@ class GeminiEmbeddingPlugin(ProxyPlugin):
                 {'X-Ai-Proxy-Server': service['name']},
             )
             print(f"✓ [gemini] Done embedContent for model={model}", flush=True)
+            return True
+
+        # Pass 1 — try free services first (non-blocking acquire)
+        remaining = list(healthy)
+        for service in list(remaining):
+            sem = _get_semaphore(service)
+            if sem.acquire(blocking=False):
+                try:
+                    if _forward(service):
+                        return
+                finally:
+                    sem.release()
+                remaining.remove(service)   # forward failed, drop from Pass 2
+
+        if not remaining:
+            handler.send_error(503, "No healthy service with geminiEmbeddingPath available")
             return
+
+        # Pass 2 — queue behind each locked service in turn
+        for service in remaining:
+            timeout = service.get('queueTimeoutSeconds', 300)
+            print(
+                f"→ [gemini] All services busy, queuing behind {service['name']} "
+                f"(timeout={timeout}s)",
+                flush=True,
+            )
+            sem = _get_semaphore(service)
+            if not sem.acquire(timeout=timeout):
+                # Pass 4 — timed out
+                print(f"✗ [gemini] Queue timeout ({timeout}s) waiting for {service['name']}", flush=True)
+                handler.send_error(429, "Service busy, please retry later")
+                return
+            try:
+                if _forward(service):
+                    return
+            finally:
+                sem.release()
 
         handler.send_error(503, "No healthy service with geminiEmbeddingPath available")
 
