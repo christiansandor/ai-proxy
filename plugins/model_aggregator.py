@@ -38,6 +38,24 @@ _cache_timestamp: float = 0.0        # epoch of last successful fetch
 _refresh_in_progress = False         # guard against concurrent refreshes
 
 
+def reset_cache() -> None:
+    """
+    Atomically clear all cache state.  Called by the config hot-reload watcher
+    in proxy.py whenever config.yaml changes.
+
+    Resetting _refresh_in_progress is the critical part: without it, if a
+    background refresh was running at the moment of reload, the flag stays True
+    and no new refresh can be triggered — models would be served forever from
+    the (now-invalidated) stale cache.
+    """
+    global _cached_models, _cache_timestamp, _refresh_in_progress
+    with _cache_lock:
+        _cached_models = None
+        _cache_timestamp = 0.0
+        _refresh_in_progress = False
+    print("  [models] Cache reset (config reload)", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

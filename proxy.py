@@ -1,5 +1,6 @@
 import http.client
 import json
+import os
 import sys
 import threading
 from pathlib import Path
@@ -14,9 +15,70 @@ from urllib.parse import urlparse
 
 import yaml
 
+_CONFIG_PATH = 'config.yaml'
+
 # Load configuration from config.yaml
-with open('config.yaml', 'r') as file:
+with open(_CONFIG_PATH, 'r') as file:
     config = yaml.safe_load(file)
+
+# ---------------------------------------------------------------------------
+# Hot-reload watcher
+# ---------------------------------------------------------------------------
+
+def _reload_config() -> None:
+    """
+    Re-read config.yaml and update the shared ``config`` dict *in-place* so
+    that every existing reference (ProxyHandler.config, plugins, etc.) picks
+    up the new values without a restart.
+
+    Side-effects on successful reload:
+      • health cache cleared  — stale service state is no longer valid
+      • model aggregator cache cleared — model list / aliases may have changed
+    """
+    try:
+        with open(_CONFIG_PATH, 'r') as f:
+            new_config = yaml.safe_load(f)
+        config.clear()
+        config.update(new_config)
+        print("✓ [config] config.yaml reloaded", flush=True)
+    except Exception as e:
+        print(f"✗ [config] Reload failed: {e}", flush=True)
+        return  # keep the old config intact
+
+    # Clear health cache — services or URLs may have changed
+    with _health_cache_lock:
+        _health_cache.clear()
+    print("  [config] Health cache cleared", flush=True)
+
+    # Invalidate the model aggregator's cache so the next /v1/models request
+    # fetches fresh data reflecting any service / alias changes.
+    try:
+        import plugins.model_aggregator as ma
+        ma.reset_cache()
+    except Exception as e:
+        print(f"  [config] Could not reset model cache: {e}", flush=True)
+
+
+def _watch_config(interval: float = 2.0) -> None:
+    """
+    Background daemon thread: polls config.yaml every *interval* seconds and
+    calls _reload_config() when the file's mtime changes.
+    """
+    try:
+        last_mtime = os.path.getmtime(_CONFIG_PATH)
+    except OSError:
+        last_mtime = 0.0
+
+    while True:
+        time.sleep(interval)
+        try:
+            mtime = os.path.getmtime(_CONFIG_PATH)
+            if mtime != last_mtime:
+                print(f"→ [config] Change detected, reloading config.yaml…", flush=True)
+                _reload_config()
+                last_mtime = mtime
+        except Exception as e:
+            print(f"✗ [config] Watch error: {e}", flush=True)
 
 # ---------------------------------------------------------------------------
 # Health cache
@@ -414,6 +476,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 def run_server():
     print("Loading plugins...")
     _load_plugins()
+
+    # Start hot-reload watcher — picks up config.yaml changes without restart
+    watcher = threading.Thread(target=_watch_config, daemon=True, name="config-watcher")
+    watcher.start()
+    print(f"→ [config] Watching {_CONFIG_PATH} for changes (poll every 2s)", flush=True)
 
     server_address = ('', 8080)
     httpd = ThreadingHTTPServer(server_address, ProxyHandler)  # type: ignore[type-arg]
