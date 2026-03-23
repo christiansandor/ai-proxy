@@ -159,3 +159,6 @@ config.yaml
 .clinerules
 data
 *.private.env.json
+
+# Issues file and plans
+ISSUES.md

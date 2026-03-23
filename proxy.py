@@ -180,7 +180,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def handle_request(self):
         self.close_connection = True
-        print(f"→ {self.command} {self.path}", flush=True)
+        self._client_label = None   # set after auth; used in subsequent logs
+        print(f"→ {self.command} {self.path}", flush=True)  # unauthenticated at this point; see _who log below
 
         # ── Read body once up-front ──────────────────────────────────────────
         content_length = int(self.headers.get('Content-Length', 0))
@@ -224,6 +225,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         self._auth_token = token_record
+        self._client_label = token_record['label']
+        print(f"→ {self._who} {self.command} {self.path}", flush=True)
         audit.log(
             'api.request',
             method=self.command,
@@ -253,7 +256,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # ── Normal proxy routing ─────────────────────────────────────────────
         services = self.find_services_for_route(self.path)
         if not services:
-            print(f"✗ No service for {self.path}", flush=True)
+            print(f"✗ {self._who} No service for {self.path}", flush=True)
             self.send_error(404, "No service found for this route")
             return
 
@@ -262,7 +265,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # ── Pass 3: nothing healthy at all ──
         if not healthy:
-            print(f"✗ No healthy service for {self.path}", flush=True)
+            print(f"✗ {self._who} No healthy service for {self.path}", flush=True)
             self.send_error(503, "No healthy service available for this route")
             return
 
@@ -271,20 +274,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
         for service in list(remaining):
             sem = _get_semaphore(service)
             if sem.acquire(blocking=False):
-                print(f"✓ Routing to {service['name']} (free)", flush=True)
+                print(f"✓ {self._who} Routing to {service['name']} (free)", flush=True)
                 try:
                     if self.forward_request(service):
-                        print(f"✓ Done {self.command} {self.path}", flush=True)
+                        print(f"✓ {self._who} Done {self.command} {self.path}", flush=True)
                         return
                 finally:
                     sem.release()
-                print(f"✗ {service['name']} failed forwarding, invalidating", flush=True)
+                print(f"✗ {self._who} {service['name']} failed forwarding, invalidating", flush=True)
                 _invalidate_health_cache(service['name'])
                 remaining.remove(service)
 
         # ── Pass 3 (second check): all free services failed, nothing left ──
         if not remaining:
-            print(f"✗ All services exhausted for {self.path}", flush=True)
+            print(f"✗ {self._who} All services exhausted for {self.path}", flush=True)
             self.send_error(503, "No healthy service available for this route")
             return
 
@@ -292,7 +295,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         for service in remaining:
             timeout = service.get('queueTimeoutSeconds', 300)
             print(
-                f"→ All services busy, queuing behind {service['name']} "
+                f"→ {self._who} All services busy, queuing behind {service['name']} "
                 f"(timeout={timeout}s)",
                 flush=True,
             )
@@ -303,25 +306,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # ── Pass 4: timed out waiting for a slot ──
             if not acquired:
                 print(
-                    f"✗ Queue timeout ({timeout}s) waiting for {service['name']}",
+                    f"✗ {self._who} Queue timeout ({timeout}s) waiting for {service['name']}",
                     flush=True,
                 )
                 self.send_error(429, "Service busy, please retry later")
                 return
 
-            print(f"✓ Routing to {service['name']} (queued)", flush=True)
+            print(f"✓ {self._who} Routing to {service['name']} (queued)", flush=True)
             try:
                 if self.forward_request(service):
-                    print(f"✓ Done {self.command} {self.path}", flush=True)
+                    print(f"✓ {self._who} Done {self.command} {self.path}", flush=True)
                     return
             finally:
                 sem.release()
 
-            print(f"✗ {service['name']} failed after queuing, trying next...", flush=True)
+            print(f"✗ {self._who} {service['name']} failed after queuing, trying next...", flush=True)
             _invalidate_health_cache(service['name'])
 
-        print(f"✗ All queued services failed for {self.path}", flush=True)
+        print(f"✗ {self._who} All queued services failed for {self.path}", flush=True)
         self.send_error(503, "No healthy service available for this route")
+
+    @property
+    def _who(self) -> str:
+        """Short client label for log lines, e.g. '[my-app]'."""
+        label = getattr(self, '_client_label', None)
+        return f'[{label}]' if label else '[unauthenticated]'
 
     def find_services_for_route(self, path):
         return [
@@ -333,6 +342,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """
         Returns True when the service passes its health check AND (if model_id
         is given) that model is present in the service's advertised model list.
+
+        Fail-closed on model list: if the health endpoint did not return a
+        parseable model list AND a model_id was requested, we refuse to route
+        to this service rather than assuming it can handle any model.  This
+        prevents routing to services whose /v1/models endpoint returned an
+        unexpected shape (e.g. auth error body, non-standard schema).
         """
         name = service['name']
         now = time.time()
@@ -345,12 +360,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if now - checked_at < ttl:
                     if not is_healthy:
                         return False
-                    if model_id and model_ids is not None and model_id not in model_ids:
-                        print(
-                            f"  [routing] {name} healthy but lacks model {model_id!r}",
-                            flush=True,
-                        )
-                        return False
+                    if model_id:
+                        if model_ids is None:
+                            print(
+                                f"  [routing] {name} returned no model list, "
+                                f"skipping for model {model_id!r}",
+                                flush=True,
+                            )
+                            return False
+                        if model_id not in model_ids:
+                            print(
+                                f"  [routing] {name} healthy but lacks model {model_id!r}",
+                                flush=True,
+                            )
+                            return False
                     return True
 
             if name in _health_check_in_progress:
@@ -368,12 +391,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         if not is_healthy:
             return False
-        if model_id and model_ids is not None and model_id not in model_ids:
-            print(
-                f"  [routing] {name} healthy but lacks model {model_id!r}",
-                flush=True,
-            )
-            return False
+        if model_id:
+            if model_ids is None:
+                print(
+                    f"  [routing] {name} returned no model list, "
+                    f"skipping for model {model_id!r}",
+                    flush=True,
+                )
+                return False
+            if model_id not in model_ids:
+                print(
+                    f"  [routing] {name} healthy but lacks model {model_id!r}",
+                    flush=True,
+                )
+                return False
         return True
 
     def _check_health(self, service) -> tuple[bool, set | None]:
@@ -383,8 +414,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 health_url = f"{service['baseUrl']}{service['health']}"
                 print(f"→ Health check: {health_url}", flush=True)
                 req = urllib.request.Request(health_url)
-                if 'token' in service:
-                    req.add_header('Authorization', f"Bearer {service['token']}")
+                token = service.get('token')
+                if token and token != 'not-needed':
+                    req.add_header('Authorization', f"Bearer {token}")
                 response = urllib.request.urlopen(req, timeout=12)
                 code = response.getcode()
                 print(f"→ Health check result: {code}", flush=True)
@@ -420,7 +452,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         return False, None
 
-    def forward_request(self, service):
+    def forward_request(self, service) -> bool:
+        """
+        Forward the request to the given service and stream the response back.
+
+        Returns True if the request was handled (response sent to client),
+        False if the backend was unreachable or returned a 5xx error — in
+        which case the caller should try the next available service.
+
+        4xx responses ARE forwarded and return True: they indicate a problem
+        with the request itself (bad input, auth failure, etc.) rather than a
+        service failure, so retrying on another backend would not help.
+        """
         parsed_base = urlparse(service['baseUrl'])
         host = parsed_base.hostname
         port = parsed_base.port or (443 if parsed_base.scheme == 'https' else 80)
@@ -432,8 +475,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if k.lower() not in ('host', 'content-length', 'transfer-encoding',
                                   'authorization')
         }
-        if 'token' in service and service['token'] != 'not-needed':
-            headers['Authorization'] = f"Bearer {service['token']}"
+        token = service.get('token')
+        if token and token != 'not-needed':
+            headers['Authorization'] = f"Bearer {token}"
 
         conn = None
         try:
@@ -444,6 +488,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             conn.request(self.command, self.path, body=body, headers=headers)
             response = conn.getresponse()
+
+            # Treat 5xx as a service failure so the router can fall through to
+            # the next healthy backend.  4xx means the request itself is at
+            # fault and retrying elsewhere won't help, so forward those normally.
+            if response.status >= 500:
+                print(
+                    f"✗ {service['name']} returned {response.status}, "
+                    "treating as service failure",
+                    flush=True,
+                )
+                _invalidate_health_cache(service['name'])
+                return False
 
             self.send_response(response.status)
             for k, v in response.getheaders():
