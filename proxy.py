@@ -408,7 +408,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return True
 
     def _check_health(self, service) -> tuple[bool, set | None]:
-        """Fetches the service health URL. Retries once after 0.5s."""
+        """
+        Fetches the service health URL to check if it's alive.
+        If `/v1/models` is in the service's routes, also fetches the model list
+        from that endpoint separately (since health endpoints may return different
+        formats like ComfyUI's /health vs OpenAI-compatible /v1/models).
+
+        Returns (is_healthy, model_ids) where model_ids comes from /v1/models if available.
+        """
+        # ── Step 1: Check health endpoint ───────────────────────────────────
         for attempt in range(2):
             try:
                 health_url = f"{service['baseUrl']}{service['health']}"
@@ -423,23 +431,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
                 if code != 200:
                     return False, None
-
-                model_ids: set | None = None
-                try:
-                    body = json.loads(response.read())
-                    data = body.get('data')
-                    if isinstance(data, list):
-                        model_ids = {m['id'] for m in data if 'id' in m}
-                        print(
-                            f"  [health] {service['name']} advertises "
-                            f"{len(model_ids)} model(s)",
-                            flush=True,
-                        )
-                except Exception:
-                    pass
-
-                return True, model_ids
-
+                break   # health check passed
             except Exception as e:
                 if attempt < 1:
                     time.sleep(0.5)
@@ -449,8 +441,42 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         f"after 2 attempts: {e}",
                         flush=True,
                     )
+                    return False, None
 
-        return False, None
+        # ── Step 2: Fetch model list if /v1/models is in routes ─────────────
+        model_ids: set | None = None
+        routes = service.get('routes', [])
+        has_models_endpoint = any('/v1/models' in r for r in routes)
+
+        if has_models_endpoint:
+            try:
+                models_url = f"{service['baseUrl']}/v1/models"
+                print(f"→ Models fetch: {models_url}", flush=True)
+                req = urllib.request.Request(models_url)
+                token = service.get('token')
+                if token and token != 'not-needed':
+                    req.add_header('Authorization', f"Bearer {token}")
+                response = urllib.request.urlopen(req, timeout=12)
+                code = response.getcode()
+                print(f"→ Models fetch result: {code}", flush=True)
+
+                if code == 200:
+                    body = json.loads(response.read())
+                    data = body.get('data')
+                    if isinstance(data, list):
+                        model_ids = {m['id'] for m in data if 'id' in m}
+                        print(
+                            f"  [health] {service['name']} advertises "
+                            f"{len(model_ids)} model(s)",
+                            flush=True,
+                        )
+            except Exception as e:
+                print(
+                    f"  [health] Could not fetch models from {service['name']}: {e}",
+                    flush=True,
+                )
+
+        return True, model_ids
 
     def forward_request(self, service) -> bool:
         """
